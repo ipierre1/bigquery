@@ -562,9 +562,10 @@ namespace AdbcDrivers.BigQuery
                     if (!authenticationType.Equals(BigQueryConstants.UserAuthenticationType, StringComparison.OrdinalIgnoreCase) &&
                         !authenticationType.Equals(BigQueryConstants.ServiceAccountAuthenticationType, StringComparison.OrdinalIgnoreCase) &&
                         !authenticationType.Equals(BigQueryConstants.EntraIdAuthenticationType, StringComparison.OrdinalIgnoreCase) &&
+                        !authenticationType.Equals(BigQueryConstants.WorkforceAuthenticationType, StringComparison.OrdinalIgnoreCase) &&
                         !authenticationType.Equals(BigQueryConstants.MockAuthenticationType, StringComparison.OrdinalIgnoreCase))
                     {
-                        throw new ArgumentException($"The {BigQueryParameters.AuthenticationType} parameter can only be `{BigQueryConstants.UserAuthenticationType}`, `{BigQueryConstants.ServiceAccountAuthenticationType}`, `{BigQueryConstants.EntraIdAuthenticationType}` or `{BigQueryConstants.MockAuthenticationType}`");
+                        throw new ArgumentException($"The {BigQueryParameters.AuthenticationType} parameter can only be `{BigQueryConstants.UserAuthenticationType}`, `{BigQueryConstants.ServiceAccountAuthenticationType}`, `{BigQueryConstants.EntraIdAuthenticationType}`, `{BigQueryConstants.WorkforceAuthenticationType}` or `{BigQueryConstants.MockAuthenticationType}`");
                     }
                     else
                     {
@@ -574,6 +575,18 @@ namespace AdbcDrivers.BigQuery
 
                 if (!string.IsNullOrEmpty(authenticationType) && authenticationType.Equals(BigQueryConstants.UserAuthenticationType, StringComparison.OrdinalIgnoreCase))
                 {
+                    // Google accounts (accounts.google.com) only exist in the default universe. Elsewhere,
+                    // e.g. S3NS, users sign in through workforce identity federation.
+                    if (UniverseDomain != null &&
+                        !string.Equals(UniverseDomain, BigQueryConstants.DefaultUniverseDomain, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new ArgumentException(
+                            $"`{BigQueryConstants.UserAuthenticationType}` authentication relies on Google accounts, which only exist in the {BigQueryConstants.DefaultUniverseDomain} universe. " +
+                            $"In the '{UniverseDomain}' universe, sign users in with {BigQueryParameters.AuthenticationType} set to `{BigQueryConstants.WorkforceAuthenticationType}`, " +
+                            $"{BigQueryParameters.AccessToken} to the token from your identity provider and {BigQueryParameters.AudienceUri} to a workforce pool provider " +
+                            "(//iam.googleapis.com/locations/global/workforcePools/POOL_ID/providers/PROVIDER_ID).");
+                    }
+
                     if (!this.properties.TryGetValue(BigQueryParameters.ClientId, out clientId))
                         throw new ArgumentException($"The {BigQueryParameters.ClientId} parameter is not present");
 
@@ -595,6 +608,25 @@ namespace AdbcDrivers.BigQuery
 
                     Credential = ApplyScopes(GoogleCredential.FromAccessToken(
                         ImpersonateIfRequested(TradeEntraIdTokenForBigQueryToken(audienceUri, accessToken, activity), activity)));
+                }
+                else if (!string.IsNullOrEmpty(authenticationType) && authenticationType.Equals(BigQueryConstants.WorkforceAuthenticationType, StringComparison.OrdinalIgnoreCase))
+                {
+                    // A user signed in through the SSO of a workforce pool provider, e.g. on S3NS where
+                    // Google accounts do not exist. The token from the identity provider is exchanged at
+                    // the Security Token Service, and queries run as the federated user.
+                    if (!this.properties.TryGetValue(BigQueryParameters.AccessToken, out accessToken))
+                        throw new ArgumentException($"The {BigQueryParameters.AccessToken} parameter is not present");
+
+                    if (!this.properties.TryGetValue(BigQueryParameters.AudienceUri, out audienceUri))
+                        throw new ArgumentException($"The {BigQueryParameters.AudienceUri} parameter is not present");
+
+                    if (!IsWorkforcePoolAudience(audienceUri))
+                        throw new ArgumentException($"The {BigQueryParameters.AudienceUri} parameter must be a workforce pool provider, such as //iam.googleapis.com/locations/global/workforcePools/POOL_ID/providers/PROVIDER_ID, when {BigQueryParameters.AuthenticationType} is `{BigQueryConstants.WorkforceAuthenticationType}`.");
+
+                    Credential = ApplyScopes(GoogleCredential.FromAccessToken(
+                        ImpersonateIfRequested(
+                            TradeEntraIdTokenForBigQueryToken(audienceUri, accessToken, activity, GetSubjectTokenType(), GetWorkforcePoolUserProject(audienceUri)),
+                            activity)));
                 }
                 else if (!string.IsNullOrEmpty(authenticationType) && authenticationType.Equals(BigQueryConstants.ServiceAccountAuthenticationType, StringComparison.OrdinalIgnoreCase))
                 {
@@ -2103,9 +2135,15 @@ namespace AdbcDrivers.BigQuery
         }
 
         /// <summary>
-        /// Exchanges the Entra token for a federated Google token at the Security Token Service.
+        /// Exchanges the Entra token, or the identity provider token of a workforce sign-in, for a
+        /// federated Google token at the Security Token Service.
         /// </summary>
-        private string? TradeEntraIdTokenForBigQueryToken(string audience, string entraAccessToken, Activity? activity)
+        private string? TradeEntraIdTokenForBigQueryToken(
+            string audience,
+            string entraAccessToken,
+            Activity? activity,
+            string subjectTokenType = BigQueryConstants.AzureSubjectTokenType,
+            string? workforcePoolUserProject = null)
         {
             try
             {
@@ -2113,7 +2151,7 @@ namespace AdbcDrivers.BigQuery
                     WorkloadIdentityFederation.TagPrefix + WorkloadIdentityFederation.StsExchangeStep + ".audience",
                     audience);
 
-                string json = CreateEntraStsRequestBody(audience, entraAccessToken);
+                string json = CreateEntraStsRequestBody(audience, entraAccessToken, subjectTokenType, workforcePoolUserProject);
 
                 using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, StsTokenEndpoint)
                 {
@@ -2146,19 +2184,84 @@ namespace AdbcDrivers.BigQuery
             }
         }
 
-        internal static string CreateEntraStsRequestBody(string audience, string entraAccessToken)
+        internal static string CreateEntraStsRequestBody(
+            string audience,
+            string entraAccessToken,
+            string subjectTokenType = BigQueryConstants.AzureSubjectTokenType,
+            string? workforcePoolUserProject = null)
         {
-            var requestBody = new
+            Dictionary<string, string> requestBody = new Dictionary<string, string>
             {
-                scope = BigQueryConstants.EntraIdScope,
-                subjectToken = entraAccessToken,
-                audience = audience,
-                grantType = BigQueryConstants.EntraGrantType,
-                subjectTokenType = BigQueryConstants.AzureSubjectTokenType,
-                requestedTokenType = BigQueryConstants.EntraRequestedTokenType
+                ["scope"] = BigQueryConstants.EntraIdScope,
+                ["subjectToken"] = entraAccessToken,
+                ["audience"] = audience,
+                ["grantType"] = BigQueryConstants.EntraGrantType,
+                ["subjectTokenType"] = subjectTokenType,
+                ["requestedTokenType"] = BigQueryConstants.EntraRequestedTokenType,
             };
 
+            // userProject only applies to workforce pools; a workload pool audience already names its project.
+            if (!string.IsNullOrEmpty(workforcePoolUserProject) && IsWorkforcePoolAudience(audience))
+            {
+                // The Security Token Service expects options as a serialized JSON object.
+                requestBody["options"] = JsonSerializer.Serialize(new { userProject = workforcePoolUserProject });
+            }
+
             return JsonSerializer.Serialize(requestBody);
+        }
+
+        internal static bool IsWorkforcePoolAudience(string audience) =>
+            audience.IndexOf(BigQueryConstants.WorkforcePoolAudienceMarker, StringComparison.Ordinal) >= 0;
+
+        /// <summary>
+        /// Resolves <see cref="BigQueryParameters.SubjectTokenType"/> to its URN, defaulting to the OIDC
+        /// ID token that an SSO sign-in produces.
+        /// </summary>
+        internal string GetSubjectTokenType()
+        {
+            if (!this.properties.TryGetValue(BigQueryParameters.SubjectTokenType, out string? configured) ||
+                string.IsNullOrEmpty(configured))
+            {
+                return BigQueryConstants.WorkforceSubjectTokenType;
+            }
+
+            if (BigQueryConstants.SubjectTokenTypes.TryGetValue(configured, out string? urn))
+            {
+                return urn;
+            }
+
+            if (BigQueryConstants.SubjectTokenTypes.Values.Contains(configured))
+            {
+                return configured;
+            }
+
+            throw new ArgumentException(
+                $"The value '{configured}' for parameter '{BigQueryParameters.SubjectTokenType}' must be one of: {string.Join(", ", BigQueryConstants.SubjectTokenTypes.Keys)}.");
+        }
+
+        /// <summary>
+        /// The quota and billing project sent with a workforce pool exchange: the configured
+        /// <see cref="BigQueryParameters.WorkforcePoolUserProject"/>, else the billing project, else the project.
+        /// </summary>
+        internal string? GetWorkforcePoolUserProject(string audience)
+        {
+            if (!IsWorkforcePoolAudience(audience))
+            {
+                return null;
+            }
+
+            foreach (string key in new[] { BigQueryParameters.WorkforcePoolUserProject, BigQueryParameters.BillingProjectId, BigQueryParameters.ProjectId })
+            {
+                if (this.properties.TryGetValue(key, out string? project) &&
+                    !string.IsNullOrEmpty(project) &&
+                    !string.Equals(project, BigQueryConstants.DetectProjectId, StringComparison.OrdinalIgnoreCase) &&
+                    !string.Equals(project, BigQueryConstants.PublicProjectId, StringComparison.OrdinalIgnoreCase))
+                {
+                    return project;
+                }
+            }
+
+            return null;
         }
 
         enum XdbcDataType

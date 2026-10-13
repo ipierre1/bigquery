@@ -48,19 +48,25 @@ The ADBC driver passes the configured credentials to BigQuery, but you may need 
 The following parameters can be used to configure the driver behavior. The parameters are case sensitive.
 
 **adbc.bigquery.access_token**<br>
-&nbsp;&nbsp;&nbsp;&nbsp;Sets the access token to use as the credential. Currently, this is for Microsoft Entra, but this could be used for other OAuth implementations as well.
+&nbsp;&nbsp;&nbsp;&nbsp;Sets the token to exchange for a Google credential: the Microsoft Entra access token for `aad`, or the token from the identity provider for `workforce`.
 
 **adbc.bigquery.audience_uri**<br>
-&nbsp;&nbsp;&nbsp;&nbsp;Sets the audience URI for the authentication token. Currently, this is for Microsoft Entra, but this could be used for other OAuth implementations as well.
+&nbsp;&nbsp;&nbsp;&nbsp;Sets the audience URI for the authentication token: the full resource name of a workload identity pool provider for `aad`, or of a workforce pool provider for `workforce` (see [Workforce identity federation](#workforce-identity-federation-sso)).
+
+**adbc.bigquery.subject_token_type**<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Optional. The type of `adbc.bigquery.access_token` declared to the Security Token Service: `id_token` (default, an OIDC ID token), `jwt` or `saml2` (a SAML assertion). Only applies when `adbc.bigquery.auth_type` is `workforce`.
+
+**adbc.bigquery.workforce_pool_user_project**<br>
+&nbsp;&nbsp;&nbsp;&nbsp;Optional. The project used for quota and billing when `adbc.bigquery.audience_uri` is a workforce pool provider, sent to the Security Token Service as `options.userProject`. Defaults to `adbc.bigquery.billing_project_id`, then to `adbc.bigquery.project_id`. Only applies when `adbc.bigquery.auth_type` is `workforce`.
 
 **adbc.bigquery.service_account_impersonation_email**<br>
-&nbsp;&nbsp;&nbsp;&nbsp;Optional. The Google service account to impersonate after the token exchange, so queries run as that account rather than as the federated caller. Only applies when `adbc.bigquery.auth_type` is `aad`; it is ignored for `user` and `service`. When omitted, the federated token is used directly. The impersonated token is requested for the scopes in `adbc.bigquery.scopes`, defaulting to `https://www.googleapis.com/auth/cloud-platform`. See [Microsoft Entra](#microsoft-entra) for the workload identity prerequisites.
+&nbsp;&nbsp;&nbsp;&nbsp;Optional. The Google service account to impersonate after the token exchange, so queries run as that account rather than as the federated caller. Only applies when `adbc.bigquery.auth_type` is `aad` or `workforce`; it is ignored for `user` and `service`. When omitted, the federated token is used directly. The impersonated token is requested for the scopes in `adbc.bigquery.scopes`, defaulting to `https://www.googleapis.com/auth/cloud-platform`. See [Microsoft Entra](#microsoft-entra) for the workload identity prerequisites.
 
 **adbc.bigquery.allow_large_results**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;Sets the [AllowLargeResults](https://cloud.google.com/dotnet/docs/reference/Google.Cloud.BigQuery.V2/latest/Google.Cloud.BigQuery.V2.QueryOptions#Google_Cloud_BigQuery_V2_QueryOptions_AllowLargeResults) value of the QueryOptions to `true` if configured; otherwise, the default is `false`.
 
 **adbc.bigquery.auth_type**<br>
-&nbsp;&nbsp;&nbsp;&nbsp;Required. Must be `user`, `aad` (for Microsoft Entra) or `service`.
+&nbsp;&nbsp;&nbsp;&nbsp;Required. Must be `user`, `aad` (for Microsoft Entra), `workforce` (for users signing in through [workforce identity federation](#workforce-identity-federation-sso)) or `service`.
 
 **adbc.bigquery.billing_project_id**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;The [Project ID](https://cloud.google.com/resource-manager/docs/creating-managing-projects) used for accessing billing BigQuery. If not specified, will default to the detected project ID.
@@ -141,7 +147,7 @@ The following parameters can be used to configure the driver behavior. The param
 &nbsp;&nbsp;&nbsp;&nbsp;Optional. Comma separated list of scopes to include for the credential.
 
 **adbc.bigquery.universe_domain**<br>
-&nbsp;&nbsp;&nbsp;&nbsp;Optional. The Google Cloud universe domain to connect to, for example `s3nsapis.fr` for [S3NS](https://www.s3ns.io/). The BigQuery, BigQuery Storage and Security Token Service hosts are derived from it (see [Endpoints to allow](#endpoints-to-allow)); IAM Credentials stays on `iamcredentials.googleapis.com` in every universe. Must be a bare domain name, without scheme, port or path. Defaults to `googleapis.com`. Because credentials are sent to hosts under this domain, only the known universes `googleapis.com`, `googleapis.de` and `s3nsapis.fr` are accepted unless `adbc.bigquery.allow_unknown_universe_domain` is set. Credentials built from an access token (`aad`) are bound to this universe; `service` JSON credentials must have been issued for it, which they record in their `universe_domain` field. `user` authentication always uses `accounts.google.com` and is only supported in the default universe.
+&nbsp;&nbsp;&nbsp;&nbsp;Optional. The Google Cloud universe domain to connect to, for example `s3nsapis.fr` for [S3NS](https://www.s3ns.io/). The BigQuery, BigQuery Storage and Security Token Service hosts are derived from it (see [Endpoints to allow](#endpoints-to-allow)); IAM Credentials stays on `iamcredentials.googleapis.com` in every universe. Must be a bare domain name, without scheme, port or path. Defaults to `googleapis.com`. Because credentials are sent to hosts under this domain, only the known universes `googleapis.com`, `googleapis.de` and `s3nsapis.fr` are accepted unless `adbc.bigquery.allow_unknown_universe_domain` is set. Credentials built from an access token (`aad`, `workforce`) are bound to this universe; `service` JSON credentials must have been issued for it, which they record in their `universe_domain` field. `user` authentication relies on Google accounts (`accounts.google.com`) and is rejected in other universes; sign users in through [workforce identity federation](#workforce-identity-federation-sso) instead.
 
 **adbc.bigquery.allow_unknown_universe_domain**<br>
 &nbsp;&nbsp;&nbsp;&nbsp;Optional. Set to `true` to accept an `adbc.bigquery.universe_domain` that is not a known universe. Defaults to `false`. Applications that let end users supply connection parameters should not pass this one through, so that credentials cannot be redirected to an arbitrary domain.
@@ -221,6 +227,19 @@ The project must also have the IAM Service Account Credentials API (`iamcredenti
 
 Both the token exchange and the impersonation call are traced. See [Tracing](#tracing) for the `wif.sts_exchange.*` and `wif.sa_impersonation.*` tags, which record the endpoint, status code, duration and Google correlation id for each step.
 
+### Workforce identity federation (SSO)
+
+In universes other than `googleapis.com`, such as S3NS, Google accounts and `accounts.google.com` do not exist: users sign in with their own identity provider through [workforce identity federation](https://cloud.google.com/iam/docs/workforce-identity-federation). The application performs the SSO sign-in and passes the resulting token to the driver, which exchanges it at the Security Token Service of the universe (`sts.<universe>`). Queries then run as the federated user.
+
+- `adbc.bigquery.auth_type`: `workforce`.
+- `adbc.bigquery.access_token`: the token from the identity provider, typically an OIDC ID token whose audience is the client ID configured on the provider.
+- `adbc.bigquery.audience_uri`: the workforce pool provider, in the form `//iam.googleapis.com/locations/global/workforcePools/POOL_ID/providers/PROVIDER_ID`. A workload identity pool is rejected; use `aad` for those.
+- `adbc.bigquery.subject_token_type`: `id_token` (default) for an OIDC ID token, `saml2` for a SAML assertion, or `jwt` for another JWT.
+- `adbc.bigquery.workforce_pool_user_project`: optional, the project for quota and billing; defaults to the billing project, then to the project.
+- `adbc.bigquery.universe_domain`: the universe, for example `s3nsapis.fr`.
+
+The federated user needs the BigQuery roles that the queries use, granted to its `principal://iam.googleapis.com/locations/global/workforcePools/POOL_ID/subject/SUBJECT` identifier or to a `principalSet://` of the pool, as well as `serviceusage.services.use` on the quota project. The token is refreshed through `UpdateToken` as described for [Microsoft Entra](#microsoft-entra). `adbc.bigquery.service_account_impersonation_email` also works with a workforce pool.
+
 ## Default Project ID
 
 If a `adbc.bigquery.project_id` is not specified, or if it equals `bigquery-public-data`, the driver will query for the first project ID that is associated with the credentials provided. This will be the project ID that is used to perform queries.
@@ -251,7 +270,7 @@ Note that `https://www.googleapis.com/auth/cloud-platform`, the default value of
 
 | Host | Used for |
 | --- | --- |
-| `sts.googleapis.com` | Security Token Service exchange, `aad` authentication only |
+| `sts.googleapis.com` | Security Token Service exchange, `aad` and `workforce` authentication only |
 | `iamcredentials.googleapis.com` | `generateAccessToken`, only when `adbc.bigquery.service_account_impersonation_email` is set |
 | `accounts.google.com` | OAuth token endpoint for `user` authentication |
 | `bigquery.googleapis.com` | BigQuery REST API: jobs, metadata and query submission |

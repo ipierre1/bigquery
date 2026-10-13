@@ -44,6 +44,18 @@ namespace AdbcDrivers.BigQuery
         /// Optional Google service account to impersonate after the Security Token Service exchange.
         /// </summary>
         public const string ServiceAccountImpersonationEmail = "adbc.bigquery.service_account_impersonation_email";
+
+        /// <summary>
+        /// Optional type of <see cref="AccessToken"/> declared to the Security Token Service for
+        /// workforce authentication: "id_token" (default), "jwt" or "saml2".
+        /// </summary>
+        public const string SubjectTokenType = "adbc.bigquery.subject_token_type";
+
+        /// <summary>
+        /// Optional project used for quota and billing when <see cref="AudienceUri"/> is a workforce
+        /// pool provider. Defaults to the billing project, then to the project.
+        /// </summary>
+        public const string WorkforcePoolUserProject = "adbc.bigquery.workforce_pool_user_project";
         public const string EvaluationKind = "adbc.bigquery.multiple_statement.evaluation_kind";
         public const string GetQueryResultsOptionsTimeout = "adbc.bigquery.get_query_results_options.timeout";
         public const string IncludeConstraintsWithGetObjects = "adbc.bigquery.include_constraints_getobjects";
@@ -112,7 +124,7 @@ namespace AdbcDrivers.BigQuery
             EvaluationKind, GetQueryResultsOptionsTimeout, IncludeConstraintsWithGetObjects,
             IncludePublicProjectId, LargeDecimalsAsString, CreateLargeResultsDataset, LargeResultsDataset, LargeResultsDestinationTable,
             MaxFetchConcurrency, MaximumRetryAttempts, UseJobCreationMode, ProjectId, RetryDelayMs, StatementIndex,
-            StatementType, UniverseDomain, AllowUnknownUniverseDomain, UseLastStatement, UseLegacySQL
+            StatementType, SubjectTokenType, UniverseDomain, AllowUnknownUniverseDomain, UseLastStatement, UseLegacySQL, WorkforcePoolUserProject
         };
 
         public static bool IsSafeToLog(string name)
@@ -131,6 +143,7 @@ namespace AdbcDrivers.BigQuery
     {
         public const string UserAuthenticationType = "user";
         public const string EntraIdAuthenticationType = "aad";
+        public const string WorkforceAuthenticationType = "workforce";
         public const string ServiceAccountAuthenticationType = "service";
         public const string MockAuthenticationType = "mock";
         public const string TokenEndpoint = "https://accounts.google.com/o/oauth2/token";
@@ -166,6 +179,26 @@ namespace AdbcDrivers.BigQuery
         /// See https://cloud.google.com/iam/docs/workload-identity-federation-with-other-clouds.
         /// </summary>
         public const string AzureSubjectTokenType = "urn:ietf:params:oauth:token-type:jwt";
+
+        /// <summary>
+        /// The subject token types accepted by <see cref="BigQueryParameters.SubjectTokenType"/>,
+        /// by short name. See https://cloud.google.com/iam/docs/reference/sts/rest/v1/TopLevel/token.
+        /// </summary>
+        public static readonly IReadOnlyDictionary<string, string> SubjectTokenTypes = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["jwt"] = AzureSubjectTokenType,
+            ["id_token"] = WorkforceSubjectTokenType,
+            ["saml2"] = "urn:ietf:params:oauth:token-type:saml2",
+        };
+
+        public const string WorkforceSubjectTokenType = "urn:ietf:params:oauth:token-type:id_token";
+
+        /// <summary>
+        /// Marks a workforce pool provider audience, e.g.
+        /// //iam.googleapis.com/locations/global/workforcePools/POOL_ID/providers/PROVIDER_ID.
+        /// Workforce pools federate users signing in through an identity provider (SSO).
+        /// </summary>
+        public const string WorkforcePoolAudienceMarker = "/workforcePools/";
 
         /// <summary>
         /// The IAM Credentials generateAccessToken endpoint; {0} is the escaped service account email.

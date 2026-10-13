@@ -15,9 +15,11 @@
 */
 
 using System;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Http;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Apache.Arrow.Adbc;
@@ -166,6 +168,150 @@ namespace AdbcDrivers.BigQuery.Tests
 
             Assert.DoesNotContain("options", body);
             Assert.DoesNotContain("userProject", body);
+        }
+
+        private const string WorkforceAudience =
+            "//iam.googleapis.com/locations/global/workforcePools/pool/providers/sso";
+
+        /// <summary>
+        /// Workforce pools federate users, whose tokens are not bound to a project, so the exchange
+        /// names the quota and billing project in options.userProject, as a serialized JSON object.
+        /// </summary>
+        [Fact]
+        public void WorkforceStsRequestBodyCarriesUserProject()
+        {
+            string body = BigQueryConnection.CreateEntraStsRequestBody(
+                WorkforceAudience, "an.idp.token", BigQueryConstants.AzureSubjectTokenType, "my-project");
+
+            using JsonDocument document = JsonDocument.Parse(body);
+            string options = document.RootElement.GetProperty("options").GetString()!;
+            using JsonDocument optionsDocument = JsonDocument.Parse(options);
+            Assert.Equal("my-project", optionsDocument.RootElement.GetProperty("userProject").GetString());
+        }
+
+        [Fact]
+        public void WorkloadStsRequestBodyIgnoresUserProject()
+        {
+            string body = BigQueryConnection.CreateEntraStsRequestBody(
+                WorkloadAudience, "an.entra.accesstoken", BigQueryConstants.AzureSubjectTokenType, "my-project");
+
+            Assert.DoesNotContain("userProject", body);
+        }
+
+        [Theory]
+        [InlineData(null, null, "my-project", "my-project")]
+        [InlineData(null, "billing-project", "my-project", "billing-project")]
+        [InlineData("quota-project", "billing-project", "my-project", "quota-project")]
+        [InlineData(null, null, BigQueryConstants.DetectProjectId, null)]
+        public void WorkforceUserProjectFallsBackToBillingThenProject(string? userProject, string? billingProject, string projectId, string? expected)
+        {
+            Dictionary<string, string> properties = new Dictionary<string, string>
+            {
+                [BigQueryParameters.AuthenticationType] = BigQueryConstants.WorkforceAuthenticationType,
+                [BigQueryParameters.ProjectId] = projectId,
+            };
+            if (userProject != null) properties[BigQueryParameters.WorkforcePoolUserProject] = userProject;
+            if (billingProject != null) properties[BigQueryParameters.BillingProjectId] = billingProject;
+
+            using BigQueryConnection connection = new BigQueryConnection(properties);
+
+            Assert.Equal(expected, connection.GetWorkforcePoolUserProject(WorkforceAudience));
+            Assert.Null(connection.GetWorkforcePoolUserProject(WorkloadAudience));
+        }
+
+        [Theory]
+        [InlineData(null, "urn:ietf:params:oauth:token-type:id_token")]
+        [InlineData("jwt", "urn:ietf:params:oauth:token-type:jwt")]
+        [InlineData("ID_TOKEN", "urn:ietf:params:oauth:token-type:id_token")]
+        [InlineData("saml2", "urn:ietf:params:oauth:token-type:saml2")]
+        [InlineData("urn:ietf:params:oauth:token-type:id_token", "urn:ietf:params:oauth:token-type:id_token")]
+        public void SubjectTokenTypeIsResolvedToItsUrn(string? configured, string expected)
+        {
+            Dictionary<string, string> properties = new Dictionary<string, string>
+            {
+                [BigQueryParameters.AuthenticationType] = BigQueryConstants.WorkforceAuthenticationType,
+            };
+            if (configured != null) properties[BigQueryParameters.SubjectTokenType] = configured;
+
+            using BigQueryConnection connection = new BigQueryConnection(properties);
+
+            Assert.Equal(expected, connection.GetSubjectTokenType());
+        }
+
+        [Fact]
+        public void UnknownSubjectTokenTypeIsRejected()
+        {
+            Dictionary<string, string> properties = new Dictionary<string, string>
+            {
+                [BigQueryParameters.AuthenticationType] = BigQueryConstants.WorkforceAuthenticationType,
+                [BigQueryParameters.SubjectTokenType] = "access_token",
+            };
+
+            using BigQueryConnection connection = new BigQueryConnection(properties);
+
+            Assert.Throws<ArgumentException>(() => connection.GetSubjectTokenType());
+        }
+
+        /// <summary>
+        /// accounts.google.com does not exist outside googleapis.com, so user authentication must
+        /// point to workforce identity federation instead of failing at the token endpoint.
+        /// </summary>
+        [Fact]
+        public void UserAuthenticationOutsideTheDefaultUniversePointsToWorkforceFederation()
+        {
+            Dictionary<string, string> properties = new Dictionary<string, string>
+            {
+                [BigQueryParameters.AuthenticationType] = BigQueryConstants.UserAuthenticationType,
+                [BigQueryParameters.UniverseDomain] = "s3nsapis.fr",
+                [BigQueryParameters.ClientId] = "client",
+                [BigQueryParameters.ClientSecret] = "secret",
+                [BigQueryParameters.RefreshToken] = "refresh",
+            };
+
+            using BigQueryConnection connection = new BigQueryConnection(properties);
+
+            ArgumentException exception = Assert.Throws<ArgumentException>(() => connection.SetCredential());
+            Assert.Contains($"`{BigQueryConstants.WorkforceAuthenticationType}`", exception.Message);
+            Assert.Contains("workforcePools", exception.Message);
+        }
+
+        /// <summary>
+        /// Workforce authentication signs users in, so a workload pool audience is a configuration
+        /// mistake that is reported before any call to the Security Token Service.
+        /// </summary>
+        [Fact]
+        public void WorkforceAuthenticationRequiresAWorkforcePoolAudience()
+        {
+            Dictionary<string, string> properties = new Dictionary<string, string>
+            {
+                [BigQueryParameters.AuthenticationType] = BigQueryConstants.WorkforceAuthenticationType,
+                [BigQueryParameters.AccessToken] = "an.idp.token",
+                [BigQueryParameters.AudienceUri] = WorkloadAudience,
+            };
+
+            using BigQueryConnection connection = new BigQueryConnection(properties);
+
+            ArgumentException exception = Assert.Throws<ArgumentException>(() => connection.SetCredential());
+            Assert.Contains(BigQueryParameters.AudienceUri, exception.Message);
+        }
+
+        [Theory]
+        [InlineData(BigQueryParameters.AccessToken)]
+        [InlineData(BigQueryParameters.AudienceUri)]
+        public void WorkforceAuthenticationRequiresTokenAndAudience(string missing)
+        {
+            Dictionary<string, string> properties = new Dictionary<string, string>
+            {
+                [BigQueryParameters.AuthenticationType] = BigQueryConstants.WorkforceAuthenticationType,
+                [BigQueryParameters.AccessToken] = "an.idp.token",
+                [BigQueryParameters.AudienceUri] = WorkforceAudience,
+            };
+            properties.Remove(missing);
+
+            using BigQueryConnection connection = new BigQueryConnection(properties);
+
+            ArgumentException exception = Assert.Throws<ArgumentException>(() => connection.SetCredential());
+            Assert.Contains(missing, exception.Message);
         }
     }
 }
